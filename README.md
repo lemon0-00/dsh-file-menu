@@ -97,6 +97,21 @@ pnpm --dir $profile add "link:E:\文档\deepseek-harness\default-workspace\dsh-f
 plugin_manager(action: "remove_bundle", target: "dsh-file-menu")
 ```
 
+### 从 GitHub 安装
+
+源码已发布在 <https://github.com/lemon0-00/dsh-file-menu>。除了上面的本地 `link:` 方式，也可以直接按仓库安装：
+
+```powershell
+# 方式一：交给 dsh CLI（会把仓库检出到 profile）
+dsh plugin --profile desktop add github:lemon0-00/dsh-file-menu
+
+# 方式二：用 Plugin Manager 按安装规格装入
+plugin_manager(action: "install_bundle",
+               target: "github:lemon0-00/dsh-file-menu")
+```
+
+从仓库安装的是**快照**（市场/CLI 会记录 commit），此后改动不会自动跟随；要边改边试就用本节的 `link:` 方式。
+
 ## 3. 使用
 
 1. 让 dsh 生成或发给你一个文件（用 `present` 产出的交付卡片，或任何带文件卡片的回复）。
@@ -115,10 +130,19 @@ dsh-file-menu/
 ├── index.js             # Host 半：3 条鉴权路由、坐标校验、桌面动作、系统「打开方式」对话框
 ├── client.js            # 浏览器半：触发按钮、右键绑定、菜单浮层、样式
 ├── icon.svg
+├── LICENSE
 ├── locale/zh.json
 ├── locale/en.json
 └── README.md
 ```
+
+### 关于 `repository` 字段（身份，不是装饰）
+
+`package.json` 里的 `repository` 指向 <https://github.com/lemon0-00/dsh-file-menu>，这个字段有实际作用：插件市场用它判断「本地这个 `link:` 安装对应目录里的哪一条插件」。
+
+没有它时，市场只能按**名字**猜——凡是同名条目，就点亮「✓ 已安装」，并出现「换用线上版本」按钮。目录里恰好有一个第三方同名插件 `dsh-file-menu`（作者 dreammaker2016，npm 名 `@z1995418/dsh-file-menu`，见 <https://github.com/dreammaker2016/dsh-file-menu>），于是本插件曾被误认成它。
+
+有了 `repository` 之后，市场走**强身份**分支：拿本仓库 `owner/repo` 去比对目录条目，匹配不上就明确判定 `repo-mismatch`（"精选目录里有同名插件，但与你本地仓库不一致，无法安全恢复"），不再按下那个按钮就装进别人的包。可用 `_check/identity-check.mjs` 与 `_check/market-view-check.mjs` 复现这条判定。
 
 ### 安全模型
 
@@ -143,3 +167,4 @@ dsh-file-menu/
 - **不接管对话正文里的行内文件链接。** 那些链接由官方 `primitives` 渲染成没有 `href`、没有 `data-*` 的按钮，接管它们必须靠哈希类名或 `title` 去猜别人的 DOM，违反插件规范，也会随官方版本抖动。验收要求的交付卡片路径已完整覆盖。
 - **不逐条列出具体应用。** 原因见 [1.0](#10-为什么没有逐条列出具体应用)：宿主枚举在 `.docx` / `.xlsx` 上会整体失败，一个时有时无的列表不如系统的「打开方式」对话框可靠。
 - 变更对比页（`deliverables.review.file.actions`）传的也是同一种 `sessionId+seq+index` 坐标，属于后续可选扩展。
+- **与第三方同名插件的关系**：目录里另有一个 `dsh-file-menu`（作者 dreammaker2016，npm 名 `@z1995418/dsh-file-menu`）。二者**不冲突**——loader entry id 不同（本插件 `dsh-file-menu`，对方 `file-menu`），且本插件已声明 `repository`，市场不会再把它认成对方。两者的取舍差异：对方是**全 UI 通用右键菜单**（文字、输入框、超链接、行内文件引用，接受任意绝对路径），本插件**只接管交付文件卡片**（见[第 1 节](#1-菜单能做什么)），坐标由宿主反查校验，并额外提供「复制文件本体」「另存为」「流式下载」。
