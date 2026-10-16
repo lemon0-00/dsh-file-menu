@@ -1,0 +1,11 @@
+# Bundle patch layer for dsh-file-menu.
+#
+# The row loads this package's main entry (index.js) as the Host half: the
+# authenticated `/api/dsh-file-menu.*` routes that open, copy, reveal, save-as
+# and download one delivered workspace file.
+#
+# The package.json `dsh.client` declaration makes the Web app load ./client.js
+# as the browser half: the right-click context menu on delivery file cards.
+- insert:
+    - id: dsh-file-menu
+      name: 'dsh-file-menu'
