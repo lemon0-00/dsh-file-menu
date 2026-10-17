@@ -22,8 +22,8 @@
  */
 import { spawn } from 'node:child_process';
 import { createReadStream } from 'node:fs';
-import { copyFile, stat as fsStat } from 'node:fs/promises';
-import { basename, dirname, extname, join } from 'node:path';
+import { copyFile, realpath, stat as fsStat } from 'node:fs/promises';
+import { basename, dirname, extname, isAbsolute, join, normalize } from 'node:path';
 import { Readable } from 'node:stream';
 
 /** Services this Host half needs before it can serve a file action. */
@@ -39,9 +39,25 @@ export const inject = [
 const INFO_PATH = '/api/dsh-file-menu.info';
 const ACT_PATH = '/api/dsh-file-menu.act';
 const RAW_PATH = '/api/dsh-file-menu.raw';
+const PATH_PATH = '/api/dsh-file-menu.path';
 
 /** Actions the Host performs itself. */
 const HOST_ACTIONS = new Set(['open', 'reveal', 'openWith', 'copy', 'copyPath', 'saveAs']);
+
+/**
+ * Actions the literal-path route performs.
+ *
+ * Deliberately a strict subset of the coordinate route, and deliberately
+ * missing the raw stream: a coordinate is a capability minted by the Session
+ * log, while a path is just a string the renderer sent. Streaming bytes for an
+ * arbitrary string would turn this route into a general file reader, so
+ * `download` and the two download-link actions exist only for delivered cards.
+ *
+ * `copyPath` and `saveAs` are missing for the same reason: the browser already
+ * holds the literal path it right-clicked, so copying it needs no Host trip,
+ * and save-as would move arbitrary bytes to a second location.
+ */
+const PATH_ACTIONS = new Set(['open', 'reveal', 'openWith', 'copy']);
 
 const NUMERIC = /^\d+$/;
 
@@ -104,6 +120,62 @@ async function resolveFile(ctx, request, id, seq, index) {
 		extension: extname(path).toLowerCase(),
 		bytes,
 		cwd: session.cwd
+	};
+}
+
+/**
+ * Resolve one literal absolute path supplied by the renderer.
+ *
+ * This is the wide route, so it is deliberately narrow in every other way:
+ *
+ * - the path must be absolute (no relative form, no `~`, no workspace guess);
+ * - it must already exist as a regular file;
+ * - it must canonicalize to itself, so a symlink or junction may not be used
+ *   to point the action somewhere other than the name that was asked for;
+ * - the composed filesystem must map it to that same canonical path, which is
+ *   the exact check the shipped desktop opener performs.
+ *
+ * On success the Host acts on the canonical path it verified, never on the
+ * string it was given.
+ *
+ * @returns the descriptor, or the response to answer with.
+ */
+async function resolveLiteral(ctx, request, rawPath) {
+	request.signal.throwIfAborted();
+	if (typeof rawPath !== 'string' || rawPath.length === 0) {
+		return new Response('A non-empty file path is required.', { status: 400 });
+	}
+	if (rawPath.length > 4096 || rawPath.includes('\n') || rawPath.includes('\0')) {
+		return new Response('Invalid file path.', { status: 400 });
+	}
+	if (!isAbsolute(rawPath)) return new Response('An absolute file path is required.', { status: 400 });
+	const requested = normalize(rawPath);
+	let canonical;
+	try {
+		canonical = await realpath(requested);
+	} catch {
+		request.signal.throwIfAborted();
+		return new Response('File not found.', { status: 404 });
+	}
+	request.signal.throwIfAborted();
+	if (canonical !== requested) {
+		// A symlink, junction, or case-variant spelling reached a different
+		// canonical file. Refuse rather than silently acting on another target.
+		return new Response('Path does not name the file it resolves to.', { status: 422 });
+	}
+	const facts = await fsStat(canonical);
+	request.signal.throwIfAborted();
+	if (!facts.isFile()) return new Response('Not a regular file.', { status: 422 });
+	const mapped = ctx.fs.processPathFromHostPath(canonical);
+	if (mapped === undefined || ctx.fs.processPath(await ctx.fs.resolve(mapped, { signal: request.signal })) !== canonical) {
+		return new Response('Path has no verified Host path.', { status: 422 });
+	}
+	return {
+		path: canonical,
+		name: basename(canonical),
+		directory: dirname(canonical),
+		extension: extname(canonical).toLowerCase(),
+		bytes: facts.size
 	};
 }
 
@@ -275,25 +347,15 @@ async function handleInfo(ctx, request) {
 }
 
 /**
- * Perform one file action.
- * @returns the action's JSON result.
+ * Carry out one action against an already resolved file.
+ *
+ * Shared by the coordinate route and the literal-path route so the two can
+ * never drift apart in behaviour. Everything is addressed by the descriptor's
+ * verified absolute path.
+ *
+ * @returns the action's JSON result, or the response to answer with.
  */
-async function handleAct(ctx, request) {
-	const found = coordinates(request);
-	if (found instanceof Response) return found;
-	const { sessionId, seq, index } = found;
-	const query = new URL(request.url).searchParams;
-	const action = query.get('action') ?? '';
-	if (!HOST_ACTIONS.has(action)) return new Response(`Unknown file action: ${action}`, { status: 400 });
-	let file;
-	try {
-		const resolved = await resolveFile(ctx, request, sessionId, seq, index);
-		if (resolved instanceof Response) return resolved;
-		file = resolved;
-	} catch (error) {
-		request.signal.throwIfAborted();
-		return new Response(`File unavailable: ${error instanceof Error ? error.message : String(error)}`, { status: 404 });
-	}
+async function performAction(ctx, request, action, file) {
 	if (action === 'copyPath') return json({ ok: true, action, path: file.path });
 	if (action === 'openWith') {
 		if (!ctx.sessionController.workspaceDesktop().available) {
@@ -339,6 +401,54 @@ async function handleAct(ctx, request) {
 	} catch (error) {
 		return new Response(`Could not save the file: ${error instanceof Error ? error.message : String(error)}`, { status: 500 });
 	}
+}
+
+/**
+ * Perform one file action addressed by delivered-file coordinates.
+ * @returns the action's JSON result.
+ */
+async function handleAct(ctx, request) {
+	const found = coordinates(request);
+	if (found instanceof Response) return found;
+	const { sessionId, seq, index } = found;
+	const query = new URL(request.url).searchParams;
+	const action = query.get('action') ?? '';
+	if (!HOST_ACTIONS.has(action)) return new Response(`Unknown file action: ${action}`, { status: 400 });
+	let file;
+	try {
+		const resolved = await resolveFile(ctx, request, sessionId, seq, index);
+		if (resolved instanceof Response) return resolved;
+		file = resolved;
+	} catch (error) {
+		request.signal.throwIfAborted();
+		return new Response(`File unavailable: ${error instanceof Error ? error.message : String(error)}`, { status: 404 });
+	}
+	return performAction(ctx, request, action, file);
+}
+
+/**
+ * Perform one file action addressed by a literal absolute path.
+ *
+ * This is the route that serves inline file references in message prose, where
+ * the renderer holds a path and no Session coordinate exists. It is kept
+ * narrower than the coordinate route on purpose — see `PATH_ACTIONS`.
+ *
+ * @returns the action's JSON result.
+ */
+async function handlePath(ctx, request) {
+	const query = new URL(request.url).searchParams;
+	const action = query.get('action') ?? '';
+	if (!PATH_ACTIONS.has(action)) return new Response(`Unknown file action: ${action}`, { status: 400 });
+	let file;
+	try {
+		const resolved = await resolveLiteral(ctx, request, query.get('path'));
+		if (resolved instanceof Response) return resolved;
+		file = resolved;
+	} catch (error) {
+		request.signal.throwIfAborted();
+		return new Response(`File unavailable: ${error instanceof Error ? error.message : String(error)}`, { status: 404 });
+	}
+	return performAction(ctx, request, action, file);
 }
 
 /**
@@ -389,7 +499,8 @@ export function apply(ctx) {
 	const routes = [
 		[INFO_PATH, ['GET'], handleInfo],
 		[ACT_PATH, ['POST'], handleAct],
-		[RAW_PATH, ['GET'], handleRaw]
+		[RAW_PATH, ['GET'], handleRaw],
+		[PATH_PATH, ['POST'], handlePath]
 	];
 	for (const [path, methods, handler] of routes) {
 		ctx.connection.fetch.register({

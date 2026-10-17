@@ -8,6 +8,7 @@ window.__ModuleLoader__.load({
 		const INFO_ROUTE = 'api/dsh-file-menu.info';
 		const ACT_ROUTE = 'api/dsh-file-menu.act';
 		const RAW_ROUTE = 'api/dsh-file-menu.raw';
+		const PATH_ROUTE = 'api/dsh-file-menu.path';
 
 		/* ------------------------------------------------------------------ *
 		 * Strings
@@ -26,6 +27,12 @@ window.__ModuleLoader__.load({
 			'menu.download': ['下载文件', 'Download file'],
 			'menu.copyLink': ['复制下载链接', 'Copy download link'],
 			'menu.openLink': ['在新标签页中打开下载链接', 'Open download link in new tab'],
+			'menu.copyUrl': ['复制链接地址', 'Copy link address'],
+			'menu.openUrl': ['在浏览器中打开链接', 'Open link in browser'],
+			'menu.urlCopied': ['链接已复制', 'Link copied'],
+			'menu.urlOpened': ['已在浏览器中打开', 'Opened in the browser'],
+			'menu.inlineCopyPath': ['复制文件路径', 'Copy file path'],
+			'note.link': ['链接', 'Link'],
 			'menu.infoFailed': ['无法读取文件信息：{reason}', 'Could not read the file: {reason}'],
 			'hint.defaultApp': ['默认应用', 'default app'],
 			'hint.paste': ['可直接粘贴', 'paste ready'],
@@ -116,8 +123,22 @@ window.__ModuleLoader__.load({
 			emit();
 		}
 
-		function openMenu(coordinates, x, y) {
-			setMenu({ open: true, target: { coordinates }, x, y });
+		/**
+		 * Open the menu on one target.
+		 *
+		 * Three target kinds exist, and they differ in where the file identity
+		 * comes from:
+		 *
+		 * - `card`: delivered-file coordinates, which the Host re-derives from
+		 *   the Session log. This is the trusted kind, and the only one that can
+		 *   stream bytes.
+		 * - `path`: a literal absolute path read off an inline file reference.
+		 *   The renderer supplied it, so the Host re-verifies it and offers a
+		 *   deliberately smaller action set.
+		 * - `url`: an ordinary link. No Host involvement at all.
+		 */
+		function openMenu(target, x, y) {
+			setMenu({ open: true, target, x, y });
 		}
 
 		function closeMenu() {
@@ -156,6 +177,105 @@ window.__ModuleLoader__.load({
 			return undefined;
 		}
 
+		/**
+		 * Recognise an inline file reference from the markup the renderer shipped.
+		 *
+		 * Inline references are the file names and paths DSH renders inside
+		 * message prose. Two shapes exist, and both carry the absolute path in
+		 * their own `title` attribute:
+		 *
+		 * - `<button class="…_fileMention">` wrapping an inline code span, whose
+		 *   `title` is the resolved absolute path of a file the turn produced;
+		 * - `<button class="…_fileMention …_fileLink">` for a markdown file link,
+		 *   whose `title` is the resolved absolute path (and is absent when the
+		 *   link is rendered as an image preview).
+		 *
+		 * The class names are hashed per build, so they are not matched on. What
+		 * is matched on is the contract the renderer publishes for its own
+		 * elements: a `<button>` whose `title` is an absolute path that names an
+		 * existing file. That is the element's own semantic attribute — the same
+		 * thing a screen reader reads — not an inferred layout detail.
+		 *
+		 * @returns the absolute path, or undefined when this is not a reference.
+		 */
+		function inlinePathAt(node) {
+			let element = node;
+			while (element && element !== document.body) {
+				if (element instanceof Element) {
+					if (element.tagName === 'BUTTON') {
+						const title = element.getAttribute('title');
+						if (isAbsolutePath(title)) return title;
+					}
+					element = element.parentElement;
+					continue;
+				}
+				break;
+			}
+			return undefined;
+		}
+
+		/**
+		 * Recognise an ordinary hyperlink from the anchor's own `href`.
+		 *
+		 * This is the link's own semantic attribute: it is what the browser would
+		 * navigate to, and what the status bar shows on hover. Only http(s) is
+		 * claimed; every other scheme, and every DSH-internal address, is left
+		 * entirely alone.
+		 */
+		function linkAt(node) {
+			let element = node;
+			while (element && element !== document.body) {
+				if (element instanceof Element) {
+					if (element.tagName === 'A') {
+						const href = element.getAttribute('href');
+						return httpUrl(href);
+					}
+					element = element.parentElement;
+					continue;
+				}
+				break;
+			}
+			return undefined;
+		}
+
+		/**
+		 * Whether a node sits inside a chat turn.
+		 *
+		 * Inline references and links are only claimed inside conversation prose.
+		 * Everywhere else — the settings panels, the plugin market, the sidebar —
+		 * the browser's own context menu is left exactly as it was, because this
+		 * plugin has nothing better to offer there and replacing a working menu
+		 * would be a regression, not a feature.
+		 */
+		function inChatFlow(node) {
+			return node instanceof Element && node.closest('[data-chat-turn]') !== null;
+		}
+
+		/**
+		 * Whether a string is an absolute filesystem path in either separator
+		 * spelling. Deliberately strict: no relative form, no `~`, no `file:` URL.
+		 */
+		function isAbsolutePath(value) {
+			if (typeof value !== 'string' || value.length < 4 || value.length > 4096) return false;
+			if (value.includes('\n') || value.includes('\0')) return false;
+			if (/^[A-Za-z]:[\\/]/.test(value)) return true;
+			if (value.startsWith('\\\\')) return true;
+			return value.startsWith('/');
+		}
+
+		/** Normalize a string to an http(s) URL, or undefined for anything else. */
+		function httpUrl(value) {
+			if (typeof value !== 'string' || value.length === 0) return undefined;
+			let parsed;
+			try {
+				parsed = new URL(value, document.baseURI);
+			} catch {
+				return undefined;
+			}
+			if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return undefined;
+			return parsed.href;
+		}
+
 		/* ------------------------------------------------------------------ *
 		 * Routes, URLs and clipboard
 		 * ------------------------------------------------------------------ */
@@ -178,15 +298,40 @@ window.__ModuleLoader__.load({
 
 		/** Build one of this plugin's route URLs from the coordinates. */
 		function routeUrl(route, coordinates, extra) {
-			const params = new URLSearchParams({
-				sessionId: coordinates.sessionId,
-				seq: coordinates.seq,
-				index: coordinates.index
-			});
+			const params = new URLSearchParams();
+			if (coordinates !== null && coordinates !== undefined) {
+				params.set('sessionId', coordinates.sessionId);
+				params.set('seq', coordinates.seq);
+				params.set('index', coordinates.index);
+			}
 			if (extra !== undefined) {
 				for (const [name, value] of Object.entries(extra)) params.set(name, value);
 			}
 			return `${route}?${params.toString()}`;
+		}
+
+		/** The file name of an absolute path, in either separator spelling. */
+		function baseNameOf(path) {
+			const parts = path.split(/[\\/]/);
+			return parts[parts.length - 1] || path;
+		}
+
+		/** The containing directory of an absolute path. */
+		function directoryOf(path) {
+			const cut = path.replace(/[\\/]+$/, '');
+			const at = Math.max(cut.lastIndexOf('\\'), cut.lastIndexOf('/'));
+			return at <= 0 ? path : cut.slice(0, at);
+		}
+
+		/** A short, readable label for a link: its host, then its path. */
+		function linkLabelOf(url) {
+			try {
+				const parsed = new URL(url);
+				const rest = `${parsed.pathname}${parsed.search}`;
+				return `${parsed.host}${rest === '/' ? '' : rest}`;
+			} catch {
+				return url;
+			}
 		}
 
 		function absoluteUrl(relative) {
@@ -413,15 +558,30 @@ window.__ModuleLoader__.load({
 		 * Put the file itself on the clipboard. The Host does this on Windows
 		 * and macOS; everywhere else the browser clipboard is tried, and the
 		 * caller falls back to copying the path.
+		 *
+		 * Two target shapes reach here. A delivered card passes its coordinates,
+		 * which the Host turns into a verified path itself. An inline reference
+		 * passes `{ path, literal: true }` and the Host re-verifies that path on
+		 * its own side. Either way the clipboard is filled by the Host process,
+		 * where a real file object can be placed — the renderer clipboard can
+		 * only carry media types the platform happens to recognise.
 		 */
-		async function copyFileBody(coordinates) {
+		async function copyFileBody(target) {
 			try {
-				const result = await runAction(coordinates, 'copy');
+				const result =
+					target.literal === true
+						? await requestJson(routeUrl(PATH_ROUTE, null, { action: 'copy', path: target.path }), {
+								method: 'POST',
+								headers: { 'content-type': 'application/json' },
+								body: '{}'
+							})
+						: await runAction(target, 'copy');
 				if (result && result.ok === true) return { copied: true, how: 'host' };
 			} catch {
 				/* the browser path below reports the real reason */
 			}
-			return copyViaBrowser(coordinates);
+			if (target.literal === true) return { copied: false, reason: 'the Host could not copy this file' };
+			return copyViaBrowser(target);
 		}
 
 		/** Trigger a browser download for the file. */
@@ -597,7 +757,7 @@ window.__ModuleLoader__.load({
 
 			const openAt = (x, y) => {
 				if (blocked) return;
-				openMenu(coordinates, x, y);
+				openMenu({ kind: 'card', coordinates }, x, y);
 			};
 
 			return h(
@@ -648,8 +808,19 @@ window.__ModuleLoader__.load({
 			const menuRef = React.useRef(null);
 			const [position, setPosition] = React.useState(null);
 
-			const coordinates = state.open && state.target ? state.target.coordinates : null;
-			const targetKey = coordinates === null ? null : coordinates.key;
+			const target = state.open ? state.target : null;
+			const kind = target === null ? null : target.kind;
+			const coordinates = kind === 'card' ? target.coordinates : null;
+			const literalPath = kind === 'path' ? target.path : null;
+			const literalUrl = kind === 'url' ? target.url : null;
+			const targetKey =
+				kind === 'card'
+					? coordinates.key
+					: kind === 'path'
+						? `path:${literalPath}`
+						: kind === 'url'
+							? `url:${literalUrl}`
+							: null;
 
 			/**
 			 * Load the addressed file's metadata, and drop it when the menu closes.
@@ -660,7 +831,7 @@ window.__ModuleLoader__.load({
 			 * from painting.
 			 */
 			React.useEffect(() => {
-				if (targetKey === null || coordinates === null) {
+				if (targetKey === null) {
 					setInfo(null);
 					setLoading(false);
 					setBusy(null);
@@ -670,6 +841,29 @@ window.__ModuleLoader__.load({
 				let cancelled = false;
 				setBusy(null);
 				setStatus(null);
+				// An inline reference carries the absolute path in its own markup,
+				// so its header is known without asking anyone. The Host is only
+				// involved when an action actually runs.
+				if (kind === 'path') {
+					setInfo({
+						name: baseNameOf(literalPath),
+						path: literalPath,
+						directory: directoryOf(literalPath),
+						size: null,
+						origin: 'inline'
+					});
+					setLoading(false);
+					return () => {
+						cancelled = true;
+					};
+				}
+				if (coordinates === null) {
+					setInfo(null);
+					setLoading(false);
+					return () => {
+						cancelled = true;
+					};
+				}
 				const cached = infoCache.get(targetKey);
 				setInfo(cached === undefined ? null : { ...cached, coordinates });
 				setLoading(cached === undefined);
@@ -720,11 +914,14 @@ window.__ModuleLoader__.load({
 				return () => cancelAnimationFrame(frame);
 			}, [state.open, state.x, state.y, info, status, busy, loading]);
 
-			if (!state.open || coordinates === null) return null;
+			if (!state.open || kind === null) return null;
 
 			const loaded = info !== null && info.failed === undefined;
 			const desktop = info !== null && info.failed === undefined ? info.desktop : undefined;
-			const rawUrl = absoluteUrl(routeUrl(RAW_ROUTE, coordinates));
+			// Only a delivered card has a coordinate-minted download URL. Inline
+			// references deliberately have none: the Host will not stream bytes for
+			// a path the renderer merely asserted.
+			const rawUrl = coordinates === null ? null : absoluteUrl(routeUrl(RAW_ROUTE, coordinates));
 			const desktopKnown = desktop !== undefined;
 			const desktopAvailable = desktopKnown && desktop.available === true;
 			// Until the info payload lands, desktop availability is unknown. Attempt
@@ -734,6 +931,16 @@ window.__ModuleLoader__.load({
 			// Before the measuring pass reports a box, the menu sits exactly at the
 			// pointer; the layout effect corrects it before the frame is painted.
 			const placed = position ?? { left: state.x, top: state.y };
+
+			/** Send one action to whichever Host route addresses this target. */
+			const dispatch = (action) => {
+				if (coordinates !== null) return runAction(coordinates, action);
+				return requestJson(routeUrl(PATH_ROUTE, null, { action, path: literalPath }), {
+					method: 'POST',
+					headers: { 'content-type': 'application/json' },
+					body: '{}'
+				});
+			};
 
 			const run = async (action, handler) => {
 				if (busy !== null) return;
@@ -772,7 +979,35 @@ window.__ModuleLoader__.load({
 
 			const items = [];
 
-			if (info !== null && info.failed !== undefined) {
+			if (kind === 'url') {
+				// A link needs nothing from the Host: the URL is the whole target.
+				items.push({
+					key: 'copyUrl',
+					iconPath: ICONS.link,
+					label: t('menu.copyUrl'),
+					onSelect: () =>
+						run('copyUrl', async () => {
+							const copied = await copyText(literalUrl);
+							return {
+								keepOpen: true,
+								status: copied
+									? { kind: 'ok', text: t('menu.urlCopied') }
+									: { kind: 'error', text: t('status.clipboardDenied') }
+							};
+						})
+				});
+				items.push({
+					key: 'openUrl',
+					iconPath: ICONS.newTab,
+					label: t('menu.openUrl'),
+					hint: literalUrl,
+					onSelect: () =>
+						run('openUrl', async () => {
+							openInNewTab(literalUrl);
+							return { status: { kind: 'ok', text: t('menu.urlOpened') } };
+						})
+				});
+			} else if (info !== null && info.failed !== undefined) {
 				// The file could not be resolved at all, so nothing here can work.
 				items.push({
 					key: 'failed',
@@ -780,9 +1015,10 @@ window.__ModuleLoader__.load({
 					label: t('menu.infoFailed', { reason: info.failed }),
 					disabled: true
 				});
-			} else {
-				// Every action below is driven by the coordinates alone, so the menu
-				// is complete and usable before any metadata arrives.
+			} else if (kind === 'path') {
+				// Inline reference: same path facts, but a deliberately shorter menu.
+				// The Host accepts only open/reveal/openWith/copy for a bare path,
+				// so no verb is offered here that the Host would refuse.
 				items.push({
 					key: 'open',
 					iconPath: ICONS.open,
@@ -790,7 +1026,7 @@ window.__ModuleLoader__.load({
 					hint: desktopAvailable ? t('hint.defaultApp') : '',
 					onSelect: () =>
 						run('open', async () => {
-							await runAction(coordinates, 'open');
+							await dispatch('open');
 							return { status: { kind: 'ok', text: t('status.opened', { name: currentName() }) } };
 						})
 				});
@@ -800,7 +1036,7 @@ window.__ModuleLoader__.load({
 					label: t('menu.openWithChooser'),
 					onSelect: () =>
 						run('openWith', async () => {
-							await runAction(coordinates, 'openWith');
+							await dispatch('openWith');
 							return { status: { kind: 'ok', text: t('status.chooserOpened') } };
 						})
 				});
@@ -810,7 +1046,7 @@ window.__ModuleLoader__.load({
 					label: t('menu.reveal'),
 					onSelect: () =>
 						run('reveal', async () => {
-							await runAction(coordinates, 'reveal');
+							await dispatch('reveal');
 							return { status: { kind: 'ok', text: t('status.revealed') } };
 						})
 				});
@@ -822,13 +1058,85 @@ window.__ModuleLoader__.load({
 					hint: t('hint.paste'),
 					onSelect: () =>
 						run('copy', async () => {
-							const known = infoCache.get(targetKey);
-							const knownPath = known && typeof known.path === 'string' ? known.path : undefined;
-							const result = await copyFileBody({ ...coordinates, path: knownPath });
+							const result = await copyFileBody({ path: literalPath, literal: true });
 							if (result.copied) {
 								return { keepOpen: true, status: { kind: 'ok', text: t('status.copied') } };
 							}
-							const copiedPath = knownPath === undefined ? false : await copyText(knownPath);
+							const copiedPath = await copyText(literalPath);
+							return {
+								keepOpen: true,
+								status: copiedPath
+									? { kind: 'error', text: t('status.copyFallback', { reason: result.reason }) }
+									: { kind: 'error', text: t('status.copyFileFailed', { reason: result.reason }) }
+							};
+						})
+				});
+				items.push({
+					key: 'copyPath',
+					iconPath: ICONS.path,
+					label: t('menu.inlineCopyPath'),
+					onSelect: () =>
+						run('copyPath', async () => {
+							const copied = await copyText(literalPath);
+							return {
+								keepOpen: true,
+								status: copied
+									? { kind: 'ok', text: t('status.copiedPath') }
+									: { kind: 'error', text: t('status.clipboardDenied') }
+							};
+						})
+				});
+			} else {
+				// Every action below is driven by the coordinates alone, so the menu
+				// is complete and usable before any metadata arrives.
+				items.push({
+					key: 'open',
+					iconPath: ICONS.open,
+					label: t('menu.open'),
+					hint: desktopAvailable ? t('hint.defaultApp') : '',
+					onSelect: () =>
+						run('open', async () => {
+							await dispatch('open');
+							return { status: { kind: 'ok', text: t('status.opened', { name: currentName() }) } };
+						})
+				});
+				items.push({
+					key: 'openWith',
+					iconPath: ICONS.app,
+					label: t('menu.openWithChooser'),
+					onSelect: () =>
+						run('openWith', async () => {
+							await dispatch('openWith');
+							return { status: { kind: 'ok', text: t('status.chooserOpened') } };
+						})
+				});
+				items.push({
+					key: 'reveal',
+					iconPath: ICONS.folder,
+					label: t('menu.reveal'),
+					onSelect: () =>
+						run('reveal', async () => {
+							await dispatch('reveal');
+							return { status: { kind: 'ok', text: t('status.revealed') } };
+						})
+				});
+				items.push({ key: 'sep-a', separator: true });
+				items.push({
+					key: 'copy',
+					iconPath: ICONS.copy,
+					label: t('menu.copy'),
+					hint: t('hint.paste'),
+					onSelect: () =>
+						run('copy', async () => {
+							const knownPath = infoCache.get(targetKey)?.path;
+							const result = await copyFileBody({
+								...coordinates,
+								path: typeof knownPath === 'string' ? knownPath : undefined
+							});
+							if (result.copied) {
+								return { keepOpen: true, status: { kind: 'ok', text: t('status.copied') } };
+							}
+							const copiedPath = typeof knownPath === 'string' ? await copyText(knownPath) : false;
 							return {
 								keepOpen: true,
 								status: copiedPath
@@ -949,9 +1257,13 @@ window.__ModuleLoader__.load({
 				);
 			}
 
-			const headerName = knownFact('name');
-			const headerPath = knownFact('path');
-			const headerDirectory = knownFact('directory');
+			const headerName = kind === 'url' ? linkLabelOf(literalUrl) : knownFact('name');
+			const headerPath = kind === 'url' ? literalUrl : knownFact('path');
+			const headerDirectory = kind === 'url' ? literalUrl : knownFact('directory');
+			const headerMeta =
+				kind === 'url'
+					? t('note.link')
+					: `${formatBytes(knownFact('size')) || t('note.sizeUnknown')} · ${headerDirectory ?? ''}`;
 			const header =
 				typeof headerName === 'string'
 					? h(
@@ -961,11 +1273,7 @@ window.__ModuleLoader__.load({
 								'div',
 								{ className: 'dfm-headtext' },
 								h('div', { className: 'dfm-name', title: headerPath }, headerName),
-								h(
-									'div',
-									{ className: 'dfm-meta', title: headerPath },
-									`${formatBytes(knownFact('size')) || t('note.sizeUnknown')} · ${headerDirectory ?? ''}`
-								)
+								h('div', { className: 'dfm-meta', title: headerPath }, headerMeta)
 							)
 						)
 					: h(
@@ -1043,15 +1351,34 @@ window.__ModuleLoader__.load({
 				return () => style.remove();
 			}, 'dsh-file-menu: styles');
 
-			// A right-click on any card carrying one of our triggers opens the menu.
+			// Right-click dispatch. Three surfaces are claimed, in this order:
+			// a delivered card this plugin registered, an inline file reference,
+			// and an ordinary http(s) link. Everything else is left untouched —
+			// no preventDefault, no stopPropagation — so the application keeps
+			// its own context menu everywhere this plugin has nothing to add.
 			ctx.effect(() => {
 				const onContextMenu = (event) => {
 					if (event.defaultPrevented) return;
 					const found = coordinatesAt(event.target);
-					if (found === undefined) return;
-					event.preventDefault();
-					event.stopPropagation();
-					openMenu(found, event.clientX, event.clientY);
+					if (found !== undefined) {
+						event.preventDefault();
+						event.stopPropagation();
+						openMenu({ kind: 'card', coordinates: found }, event.clientX, event.clientY);
+						return;
+					}
+					const path = inlinePathAt(event.target);
+					if (path !== undefined && inChatFlow(event.target)) {
+						event.preventDefault();
+						event.stopPropagation();
+						openMenu({ kind: 'path', path }, event.clientX, event.clientY);
+						return;
+					}
+					const url = linkAt(event.target);
+					if (url !== undefined && inChatFlow(event.target)) {
+						event.preventDefault();
+						event.stopPropagation();
+						openMenu({ kind: 'url', url }, event.clientX, event.clientY);
+					}
 				};
 				const onKeyDown = (event) => {
 					if (event.key === 'Escape') closeMenu();
